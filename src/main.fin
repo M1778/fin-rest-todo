@@ -1,0 +1,278 @@
+// fin-rest-todo — a REST todo API in Fin (v0.1.0).
+//
+// Stack: zhttp server (blocking accept loop) + finson JSON (request
+// parsing, response building). Single-file app; the store is in memory
+// (fixed arrays, cap 1024 todos) and dies with the process.
+//
+// Routes (all bodies are JSON; all responses are JSON):
+//   GET    /todos        -> 200 [todo, ...]
+//   POST   /todos        -> 201 todo            (body {"title": "..."})
+//   GET    /todos/<id>   -> 200 todo | 404
+//   PUT    /todos/<id>   -> 200 todo | 404       (body {"title"?, "done"?})
+//   DELETE /todos/<id>   -> 200 deleted todo | 404
+//   anything else        -> 404 {"error": "not found"}
+//
+// Error contract: malformed JSON or a wrongly-typed field -> 400
+// {"error": "..."} (finson's ParseResult is recoverable — never `blame`
+// on client input). Unknown route/id -> 404. The server never aborts on
+// a request: every handler returns a response.
+//
+// Usage: ./fin-rest-todo [port]   (default port 8080)
+//   Port is argv[1] via /proc/self/cmdline (Linux-only, fin-ssg's recipe).
+//   Known stdlib caveat: Socket::serve lacks SO_REUSEADDR, so restarting
+//   on the SAME port within ~60s of serving a client fails to bind —
+//   the smoke test uses a fresh port per run to dodge it.
+//
+// Build:
+//   finc -I <finson>/src -I <zhttp>/src src/main.fin -o fin-rest-todo
+
+import {
+    HttpRequest, HttpResponse, HttpReadResult, HttpServer, HttpConn,
+    http_listen, http_server_port, http_accept, http_read_request,
+    http_write_response, http_response_with_type,
+    http_free_response, http_free_read_result, http_close, http_server_close
+} from zhttp::fin;
+import {
+    JsonValue, ParseResult,
+    json_object, json_array, json_array_push,
+    json_object_set, json_object_get, json_object_has,
+    json_num_int, json_str, json_bool,
+    json_parse, json_stringify, json_free, json_free_result
+} from finson::fin;
+import { len, substr, concat, equals, starts_with, find, is_numeric, parse_int, free_str, clone, from_chars } from strings::std;
+
+// --- argv via Linux procfs (same recipe as fin-ssg / cli::std) ------------
+#[llvm_name="open"]
+@define todo_open(path: string, flags: int) <int>;
+
+#[llvm_name="read"]
+@define todo_read(fd: int, buf: &char, count: ulong) <long>;
+
+#[llvm_name="close"]
+@define todo_close(fd: int) <int>;
+
+struct Argv { args <[string]>, count <int>, ok <bool> }
+
+fun read_argv() <Argv> {
+    let argv <Argv> = Argv{ args: new [string, 64]{}, count: 0, ok: false };
+    let buf <[char]> = new [char, 4096]{};
+    let fd <int> = todo_open("/proc/self/cmdline", 0);
+    if (fd < 0) { delete buf; return argv; }
+    let got <long> = todo_read(fd, &buf[0], cast<ulong>(4096));
+    todo_close(fd);
+    if (got <= cast<long>(0)) { delete buf; return argv; }
+    let end <int> = cast<int>(got);
+    let skip_first <bool> = true;
+    let start <int> = 0;
+    for (let i <int> = 0; i < end; i++) {
+        if (buf[i] == cast<char>(0)) {
+            if (i > start) {
+                if (skip_first) {
+                    skip_first = false;
+                } else if (argv.count < 64) {
+                    argv.args[argv.count] = from_chars(buf, start, i - start);
+                    argv.count = argv.count + 1;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    delete buf;
+    argv.ok = true;
+    return argv;
+}
+
+// --- store -----------------------------------------------------------------
+struct TodoStore {
+    ids <[int]>,
+    titles <[string]>,
+    dones <[bool]>,
+    count <int>,
+    next_id <int>
+}
+
+fun new_store() <TodoStore> {
+    return TodoStore{
+        ids: new [int, 1024]{},
+        titles: new [string, 1024]{},
+        dones: new [bool, 1024]{},
+        count: 0,
+        next_id: 1
+    };
+}
+
+fun find_index(st: &TodoStore, id: int) <int> {
+    for (let i <int> = 0; i < st.count; i++) {
+        if (st.ids[i] == id) { return i; }
+    }
+    return -1;
+}
+
+// --- JSON helpers ----------------------------------------------------------
+// http_response_with_type clones the body, so callers free theirs after.
+fun respond(status: int, body: string) <&HttpResponse> {
+    let r <&HttpResponse> = http_response_with_type(status, "application/json", body);
+    free_str(body);
+    return r;
+}
+
+fun todo_json(st: &TodoStore, idx: int) <string> {
+    let obj <&JsonValue> = json_object();
+    json_object_set(obj, "id", json_num_int(st.ids[idx]));
+    json_object_set(obj, "title", json_str(st.titles[idx]));
+    json_object_set(obj, "done", json_bool(st.dones[idx]));
+    let s <string> = json_stringify(obj);
+    json_free(obj);
+    return s;
+}
+
+fun list_json(st: &TodoStore) <string> {
+    let arr <&JsonValue> = json_array();
+    for (let i <int> = 0; i < st.count; i++) {
+        let obj <&JsonValue> = json_object();
+        json_object_set(obj, "id", json_num_int(st.ids[i]));
+        json_object_set(obj, "title", json_str(st.titles[i]));
+        json_object_set(obj, "done", json_bool(st.dones[i]));
+        json_array_push(arr, obj);
+    }
+    let s <string> = json_stringify(arr);
+    json_free(arr);
+    return s;
+}
+
+fun err_json(msg: string) <string> {
+    let obj <&JsonValue> = json_object();
+    json_object_set(obj, "error", json_str(msg));
+    let s <string> = json_stringify(obj);
+    json_free(obj);
+    return s;
+}
+
+// --- routing ---------------------------------------------------------------
+// Path with any "?query" stripped (the stripped tail is a fresh string
+// owned by nobody — a tiny per-request leak, same as zhttp's own style).
+fun strip_query(target: string) <string> {
+    let q <int> = find(target, "?");
+    if (q < 0) { return target; }
+    return substr(target, 0, q);
+}
+
+// Id from "/todos/<id>", or -1 when the path is not a single numeric id.
+// (len <= 9 guards parse_int's overflow blame on hostile input.)
+fun path_id(path: string) <int> {
+    if (!starts_with(path, "/todos/")) { return -1; }
+    let seg <string> = substr(path, 7, len(path) - 7);
+    if (equals(seg, "")) { return -1; }
+    if (find(seg, "/") >= 0) { return -1; }
+    if (!is_numeric(seg)) { return -1; }
+    if (len(seg) > 9) { return -1; }
+    return parse_int(seg);
+}
+
+fun handle(st: &TodoStore, req: &HttpRequest) <&HttpResponse> {
+    let path <string> = strip_query(req.target);
+    if (equals(req.method, "GET") && equals(path, "/todos")) {
+        return respond(200, list_json(st));
+    }
+    if (equals(req.method, "POST") && equals(path, "/todos")) {
+        let r <ParseResult> = json_parse(req.body);
+        if (!r.ok) { json_free_result(&r); return respond(400, err_json("invalid JSON")); }
+        if (r.value.kind != 5) { json_free_result(&r); return respond(400, err_json("body must be an object")); }
+        let tv <&JsonValue> = json_object_get(r.value, "title");
+        if (tv == null || tv.kind != 3) { json_free_result(&r); return respond(400, err_json("title must be a string")); }
+        if (st.count >= 1024) { json_free_result(&r); return respond(500, err_json("store full")); }
+        let title <string> = clone(tv.s);
+        json_free_result(&r);
+        let idx <int> = st.count;
+        st.ids[idx] = st.next_id;
+        st.next_id = st.next_id + 1;
+        st.titles[idx] = title;
+        st.dones[idx] = false;
+        st.count = st.count + 1;
+        return respond(201, todo_json(st, idx));
+    }
+    let id <int> = path_id(path);
+    if (id < 0) { return respond(404, err_json("not found")); }
+    if (equals(req.method, "GET")) {
+        let idx <int> = find_index(st, id);
+        if (idx < 0) { return respond(404, err_json("todo not found")); }
+        return respond(200, todo_json(st, idx));
+    }
+    if (equals(req.method, "PUT")) {
+        let idx <int> = find_index(st, id);
+        if (idx < 0) { return respond(404, err_json("todo not found")); }
+        let r <ParseResult> = json_parse(req.body);
+        if (!r.ok) { json_free_result(&r); return respond(400, err_json("invalid JSON")); }
+        if (r.value.kind != 5) { json_free_result(&r); return respond(400, err_json("body must be an object")); }
+        // Validate everything before mutating anything.
+        let new_title <string> = "";
+        let has_title <bool> = false;
+        let new_done <bool> = false;
+        let has_done <bool> = false;
+        let bad <bool> = false;
+        if (json_object_has(r.value, "title")) {
+            let tv <&JsonValue> = json_object_get(r.value, "title");
+            if (tv == null || tv.kind != 3) { bad = true; }
+            else { new_title = clone(tv.s); has_title = true; }
+        }
+        if (json_object_has(r.value, "done")) {
+            let dv <&JsonValue> = json_object_get(r.value, "done");
+            if (dv == null || dv.kind != 1) { bad = true; }
+            else { new_done = dv.b; has_done = true; }
+        }
+        if (bad) {
+            if (has_title) { free_str(new_title); }
+            json_free_result(&r);
+            return respond(400, err_json("title must be a string and done must be a boolean"));
+        }
+        if (has_title) {
+            free_str(st.titles[idx]);
+            st.titles[idx] = new_title;
+        }
+        if (has_done) { st.dones[idx] = new_done; }
+        json_free_result(&r);
+        return respond(200, todo_json(st, idx));
+    }
+    if (equals(req.method, "DELETE")) {
+        let idx <int> = find_index(st, id);
+        if (idx < 0) { return respond(404, err_json("todo not found")); }
+        let body <string> = todo_json(st, idx);
+        free_str(st.titles[idx]);
+        for (let i <int> = idx; i + 1 < st.count; i++) {
+            st.ids[i] = st.ids[i + 1];
+            st.titles[i] = st.titles[i + 1];
+            st.dones[i] = st.dones[i + 1];
+        }
+        st.count = st.count - 1;
+        return respond(200, body);
+    }
+    return respond(404, err_json("not found"));
+}
+
+fun main() <noret> {
+    let argv <Argv> = read_argv();
+    let port <int> = 8080;
+    if (argv.count >= 1 && is_numeric(argv.args[0]) && len(argv.args[0]) <= 5) {
+        port = parse_int(argv.args[0]);
+    }
+    let store <TodoStore> = new_store();
+    let srv <&HttpServer> = http_listen(port);
+    printf("fin-rest-todo on http://127.0.0.1:%d/ (Ctrl-C to stop)\n", http_server_port(srv));
+    while (true) {
+        let conn <&HttpConn> = http_accept(srv);
+        let rr <HttpReadResult> = http_read_request(conn);
+        if (rr.ok) {
+            let resp <&HttpResponse> = handle(&store, rr.req);
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        } else {
+            let resp <&HttpResponse> = respond(400, err_json("bad request"));
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        }
+        http_close(conn);
+    }
+    http_server_close(srv);
+}

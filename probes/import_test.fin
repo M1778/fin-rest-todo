@@ -1,0 +1,26 @@
+// import_test.fin — UNVERIFIED gating probe for fin-rest-todo.
+//
+// Proves the library-import path BEFORE any fin-rest-todo design assumes it:
+//   import { json_parse } from finson::fin;
+// must build AND run (per the dependency discipline in TASKS.md).
+//
+// Prove it with:
+//   finc -I <finson-checkout>/src probes/import_test.fin -o import_test
+//   ./import_test            # expect "finson import OK"
+//
+// If the import refuses at codegen, record the exact error in NOTES.md
+// "Backend gaps" and do NOT start fin-rest-todo until it is resolved.
+
+import { ParseResult, json_parse, json_free_result } from finson::fin;
+
+fun main() <int> {
+    let r <ParseResult> = json_parse("{\"ok\": true}");
+    if (!r.ok) {
+        printf("parse failed\n");
+        json_free_result(&r);
+        return 1;
+    }
+    printf("finson import OK\n");
+    json_free_result(&r);
+    return 0;
+}

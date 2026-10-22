@@ -1,0 +1,15 @@
+# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
+[project]
+name = "fin-rest-todo"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "main.fin"
+
+[packages]
+finson = "M1778/finson@0.1.0"
+zhttp = "M1778/zhttp@0.1.0"
+
+[scripts]
+check = "finc -I <finson>/src -I <zhttp>/src src/main.fin"
+build = "finc -I <finson>/src -I <zhttp>/src src/main.fin -o fin-rest-todo"
+smoke = "python3 tests/smoke.py"
